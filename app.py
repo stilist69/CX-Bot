@@ -20,6 +20,11 @@ from telegram.error import TimedOut, RetryAfter, NetworkError
 import gspread
 from gspread.exceptions import APIError
 
+def is_exit(text: str) -> bool:
+    t = (text or "").strip().casefold()
+    t = t.replace("🔚", "").strip()
+    return t.endswith("завершити")
+
 # =========================
 # Generalized async retry
 # =========================
@@ -44,6 +49,8 @@ def _next_delay(base: float, attempt_idx: int, max_delay: float, jitter: float) 
     delay *= (1 - jitter) + (2 * jitter) * random.random()
     return delay
 
+FIXED_DELAYS = [1.0, 2.0, 2.0, 3.0, 5.0]
+
 async def retry_async(func: Callable, *args, cfg: RetryConfig, **kwargs):
     attempt = 0
     while True:
@@ -53,7 +60,12 @@ async def retry_async(func: Callable, *args, cfg: RetryConfig, **kwargs):
             attempt += 1
             if attempt >= cfg.attempts:
                 raise
-            await asyncio.sleep(_next_delay(cfg.base_delay, attempt-1, cfg.max_delay, cfg.jitter))
+            # Respect Telegram's suggested wait on 429
+            if isinstance(e, RetryAfter) and getattr(e, "retry_after", None):
+                await asyncio.sleep(e.retry_after)
+            else:
+                idx = min(attempt-1, len(FIXED_DELAYS)-1)
+                await asyncio.sleep(FIXED_DELAYS[idx])
 
 # Retry presets
 TG_RETRY = RetryConfig(
@@ -71,7 +83,7 @@ async def safe_reply(msg, *, cfg: RetryConfig = TG_RETRY, **kw):
 
 # --- Env ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "set-a-secret")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 APP_BASE_URL = os.getenv("APP_BASE_URL")  # e.g. https://your-app.run.app
 SHEET_ID = os.getenv("SHEET_ID")
 GCP_SERVICE_ACCOUNT = os.getenv("GCP_SERVICE_ACCOUNT")  # JSON string (from Secret)
@@ -83,6 +95,8 @@ if not SHEET_ID:
     raise RuntimeError("SHEET_ID is required")
 if not GCP_SERVICE_ACCOUNT:
     raise RuntimeError("GCP_SERVICE_ACCOUNT JSON is required")
+if not WEBHOOK_SECRET:
+    raise RuntimeError("WEBHOOK_SECRET is required")
 
 # --- Google Sheets client ---
 def _gs_client():
@@ -183,7 +197,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    if text.endswith("Завершити"):
+    if is_exit(text):
         context.user_data.clear()
         await safe_reply(update.message,
             text="Сесію завершено. Щоб почати заново — оберіть роль нижче 👇" + _cta_suffix(),
@@ -213,7 +227,11 @@ async def ask_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
-    if txt.endswith("Завершити"):
+    # Guard: if user answers without role/session, return to role choice
+    if "role" not in context.user_data or "i" not in context.user_data:
+        await safe_reply(update.message, text="Спочатку оберіть роль 👇", reply_markup=ROLE_KB)
+        return CHOOSING_ROLE
+    if is_exit(txt):
         return await cancel(update, context)
 
     role = context.user_data["role"]
@@ -251,13 +269,11 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update, context):
     context.user_data.clear()
-    await update.message.reply_text(
-        "Готово. Можете пройти мікроаудит ще раз — просто оберіть роль нижче 👇",
+    await safe_reply(update.message,
+        text="Готово. Можете пройти мікроаудит ще раз — просто оберіть роль нижче 👇",
         reply_markup=ROLE_KB
     )
     return CHOOSING_ROLE
-
-exit_handler = MessageHandler(filters.Regex(r"^🔚 Завершити$"), cancel)
 
 # --- FastAPI + PTB integration ---
 app = FastAPI(title="CX Bot")
@@ -269,9 +285,9 @@ application: Application = ApplicationBuilder().token(BOT_TOKEN).persistence(per
 conv = ConversationHandler(
     entry_points=[CommandHandler("start", start)],
     states={
-        CHOOSING_ROLE: [exit_handler,
+        CHOOSING_ROLE: [
                         MessageHandler(filters.TEXT & ~filters.COMMAND, choose_role)],
-        ASKING:        [exit_handler,
+        ASKING:        [
                         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_answer)],
     },
     fallbacks=[CommandHandler("cancel", cancel)],
@@ -286,10 +302,17 @@ class WebhookModel(BaseModel):
 
 # --- Catch-all fallback (на випадок будь-якого тексту поза сценарієм)
 async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_reply(
-        update.message,
-        text="Зараз ми проходимо тест 🙂 Оберіть варіант нижче 👇"
-    )
+    # Якщо користувач ще не у сценарії — показуємо стартовий вибір ролей (без /start)
+    if "role" not in context.user_data or "i" not in context.user_data:
+        await safe_reply(update.message,
+            text="Оберіть роль, щоб почати 👇",
+            reply_markup=ROLE_KB)
+        return CHOOSING_ROLE
+    # Якщо у сценарії — нагадуємо про A/B/C або Завершити
+    await safe_reply(update.message,
+        text="Будь ласка, оберіть A, B або C, або натисніть «Завершити» 👇",
+        reply_markup=ABC_KB)
+    return ASKING
 
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
 
