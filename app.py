@@ -249,14 +249,12 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return CHOOSING_ROLE
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()  # очищаємо стан користувача
-
+async def cancel(update, context):
+    context.user_data.clear()
     await update.message.reply_text(
         "Готово. Можете пройти мікроаудит ще раз — просто оберіть роль нижче 👇",
         reply_markup=ROLE_KB
     )
-
     return CHOOSING_ROLE
 
 exit_handler = MessageHandler(filters.Regex(r"^🔚 Завершити$"), cancel)
