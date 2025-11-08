@@ -195,5 +195,15 @@ async def telegram_webhook(secret: str, request: Request):
     await application.process_update(update)
     return {"ok": True}
 
+@app.on_event("startup")
+async def on_startup():
+    await application.initialize()
+    await application.start()
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await application.stop()
+    await application.shutdown()
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
