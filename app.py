@@ -152,10 +152,14 @@ ROLE_KB = ReplyKeyboardMarkup(
     )
 ABC_KB  = ReplyKeyboardMarkup([["A","B","C"]], resize_keyboard=True)
 
-def role_code_from_text(text: str) -> str:
-    if "Керівник" in text: return "kerivnyk"
-    if "Лікар" in text: return "likar"
-    return "admin"
+ROLE_LABELS = {
+    "👩‍💼 Керівник": "kerivnyk",
+    "🦷 Лікар": "likar",
+    "💬 Адміністратор": "admin",
+}
+
+def role_code_from_text(text: str) -> str | None:
+    return ROLE_LABELS.get(text.strip())
 
 def _cta_suffix() -> str:
     if CONTACT_USERNAME:
@@ -178,17 +182,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSING_ROLE
 
 async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if (text or "").strip().endswith("Завершити"):
-        # «Reset & back to start»
+    text = (update.message.text or "").strip()
+    if text.endswith("Завершити"):
         context.user_data.clear()
-        await safe_reply(
-            update.message,
+        await safe_reply(update.message,
             text="Сесію завершено. Щоб почати заново — оберіть роль нижче 👇" + _cta_suffix(),
-            reply_markup=ROLE_KB
-        )
+            reply_markup=ROLE_KB)
         return CHOOSING_ROLE
+
     role = role_code_from_text(text)
+    if not role:
+        # не приймаємо довільний текст — просимо натиснути кнопку
+        await safe_reply(update.message,
+            text="Будь ласка, оберіть роль на клавіатурі нижче 👇",
+            reply_markup=ROLE_KB)
+        return CHOOSING_ROLE
+
     context.user_data["role"] = role
     context.user_data["i"] = 0
     context.user_data["errors"] = 0
