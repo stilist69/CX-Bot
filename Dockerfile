@@ -1,4 +1,3 @@
-# Python Telegram bot on Koyeb
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -9,4 +8,4 @@ COPY app.py ./
 
 ENV PORT=8000
 EXPOSE 8000
-CMD ["python", "app.py"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
