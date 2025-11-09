@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 import os
-import re
 import json
 import random
 import asyncio
-from typing import Callable, Type, Iterable, Dict, Any, List, Tuple, Optional
+from typing import Callable, Iterable, Type, Dict, List, Tuple
 from datetime import datetime
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
 import uvicorn
 
 from telegram import Update, ReplyKeyboardMarkup
@@ -22,33 +20,24 @@ from telegram.error import TimedOut, RetryAfter, NetworkError
 # Optional Google Sheets logging
 try:
     import gspread
-    from gspread.exceptions import APIError
+    from gspread.exceptions import APIError as GSAPIError, WorksheetNotFound
     HAS_GS = True
 except Exception:
     HAS_GS = False
-    class APIError(Exception):
-        pass
-
-def is_exit(text: str) -> bool:
-    t = (text or "").casefold().strip()
-    t = t.replace("🔚", "").strip()
-    return t.endswith("завершити")
-
-ROLE_BUTTONS = {"👩‍💼 Керівник", "🦷 Лікар", "💬 Адміністратор"}
-ABC_BUTTONS  = {"A", "B", "C"}
-EXIT_TEXTS   = {"🔚 Завершити", "Завершити"}
-
-ROLE_KB = ReplyKeyboardMarkup([["👩‍💼 Керівник"],["🦷 Лікар"],["💬 Адміністратор"],["🔚 Завершити"]], resize_keyboard=True)
-ABC_KB  = ReplyKeyboardMarkup([["A","B","C"],["🔚 Завершити"]], resize_keyboard=True)
-
-CHOOSING_ROLE, ASKING = range(2)
+    class GSAPIError(Exception): ...
+    class WorksheetNotFound(Exception): ...
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-APP_BASE_URL = os.getenv("APP_BASE_URL", "")  # for set_webhook
+APP_BASE_URL = os.getenv("APP_BASE_URL", "")
+CONTACT_USERNAME = os.getenv("CONTACT_USERNAME", "@PavelZolottsev")
+
+GS_CREDENTIALS_JSON = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON", "")
+GS_SPREADSHEET_KEY  = os.getenv("GOOGLE_SHEETS_SPREADSHEET_KEY", "")
+GS_WORKSHEET_NAME   = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "STAT")
 
 class RetryConfig:
     def __init__(self, attempts: int = 5, delays: List[float] = None, jitter: float = 0.0,
-                 retry_on: Iterable[Type[BaseException]] = (TimedOut, RetryAfter, NetworkError, APIError)):
+                 retry_on: Iterable[Type[BaseException]] = (TimedOut, RetryAfter, NetworkError, GSAPIError)):
         self.attempts = attempts
         self.delays = delays or [1.0, 2.0, 2.0, 3.0, 5.0]
         self.jitter = jitter
@@ -78,57 +67,119 @@ async def safe_reply(message, *, text: str, reply_markup=None):
         return await message.reply_text(text=text, reply_markup=reply_markup)
     return await retry_async(_send, cfg=TG_RETRY)
 
-def qfmt(q, a, b, c): return f"{q}\n\nA) {a}\nB) {b}\nC) {c}"
+ROLE_KB = ReplyKeyboardMarkup(
+    [["👩‍💼 Керівник"], ["🦷 Лікар"], ["💬 Адміністратор"], ["🔚 Завершити"]],
+    resize_keyboard=True
+)
+ABC_KB = ReplyKeyboardMarkup(
+    [["A", "B", "C"], ["🔚 Завершити"]],
+    resize_keyboard=True
+)
+
+ROLE_BUTTONS = {"👩‍💼 Керівник", "🦷 Лікар", "💬 Адміністратор"}
+ABC_BUTTONS = {"A", "B", "C"}
+EXIT_BUTTONS = {"🔚 Завершити", "Завершити"}
+
+CHOOSING_ROLE, ASKING = range(2)
+
+def _cta_suffix() -> str:
+    handle = (CONTACT_USERNAME or "").lstrip("@")
+    return f"\n\nНапишіть мені в особисті: @{handle} — підкажу, як швидко підтягнути сервіс." if handle else ""
+
+def qfmt(q, a, b, c):
+    return f"{q}\n\nA) {a}\nB) {b}\nC) {c}"
 
 QUESTIONS: Dict[str, List[Tuple[str, str]]] = {
     "Керівник": [
-        (qfmt("Як ви дізнаєтесь, що пацієнт залишився задоволеним?","Якщо не скаржився — значить, усе добре.","Ми періодично запитуємо відгуки.","Лікарі самі бачать, коли пацієнт задоволений."), "B"),
-        (qfmt("Як часто ви обговорюєте сервіс із командою?","Раз на рік на загальних зборах.","Коли з’являються проблеми.","Регулярно, як частину роботи."), "C"),
-        (qfmt("Що для вас важливіше: нові пацієнти чи повторні?","Головне — потік нових.","Повторні — бо це показник довіри.","Обидва варіанти однакові."), "B"),
-        (qfmt("Коли востаннє ви проходили шлях пацієнта особисто (дзвінок, запис, прийом)?","Ніколи.","Давно, але колись робив(-ла).","Роблю це регулярно."), "C"),
-        (qfmt("Як ви реагуєте на скаргу?","Захищаю команду — вони стараються.","Розбираюсь спокійно, шукаю, що можна покращити.","Ігнорую, якщо пацієнт «важкий»."), "B"),
+        (qfmt("Як ви дізнаєтесь, що пацієнт залишився задоволеним?",
+              "Якщо не скаржився — значить, усе добре.",
+              "Ми періодично запитуємо відгуки.",
+              "Лікарі самі бачать, коли пацієнт задоволений."), "B"),
+        (qfmt("Як часто ви обговорюєте сервіс із командою?",
+              "Раз на рік на загальних зборах.",
+              "Коли з’являються проблеми.",
+              "Регулярно, як частину роботи."), "C"),
+        (qfmt("Що для вас важливіше: нові пацієнти чи повторні?",
+              "Головне — потік нових.",
+              "Повторні — бо це показник довіри.",
+              "Обидва варіанти однакові."), "B"),
+        (qfmt("Коли востаннє ви проходили шлях пацієнта особисто (дзвінок, запис, прийом)?",
+              "Ніколи.",
+              "Давно, але колись робив(-ла).",
+              "Роблю це регулярно."), "C"),
+        (qfmt("Як ви реагуєте на скаргу?",
+              "Захищаю команду — вони стараються.",
+              "Розбираюсь спокійно, шукаю, що можна покращити.",
+              "Ігнорую, якщо пацієнт «важкий»."), "B"),
     ],
     "Лікар": [
-        (qfmt("Як ви пояснюєте пацієнту план лікування?","Стисло — без деталей.","Детально, простою мовою, показую приклади.","Лише тоді, коли питає."), "B"),
-        (qfmt("Що ви робите, якщо пацієнт нервує?","Продовжую працювати — час дорогоцінний.","Роблю паузу, пояснюю, що буде далі.","Прошу адміністратора/асистента заспокоїти."), "B"),
-        (qfmt("Як ви передаєте інформацію адміністратору після прийому?","Усно, коли є час.","Через нотатку або у CRM.","Не передаю — він сам розбереться."), "B"),
-        (qfmt("Що ви робите, якщо пацієнт відмовляється від лікування?","Пропоную дешевший варіант.","Запитую, що саме викликає сумнів.","Просто фіксую відмову."), "B"),
-        (qfmt("Як ви ставитесь до відгуків пацієнтів?","Не читаю — зайве нервування.","Читаю і думаю, як покращити комунікацію.","Вважаю, що більшість пишуть емоційно."), "B"),
+        (qfmt("Як ви пояснюєте пацієнту план лікування?",
+              "Стисло — без деталей.",
+              "Детально, простою мовою, показую приклади.",
+              "Лише тоді, коли питає."), "B"),
+        (qfmt("Що ви робите, якщо пацієнт нервує?",
+              "Продовжую працювати — час дорогоцінний.",
+              "Роблю паузу, пояснюю, що буде далі.",
+              "Прошу адміністратора/асистента заспокоїти."), "B"),
+        (qfmt("Як ви передаєте інформацію адміністратору після прийому?",
+              "Усно, коли є час.",
+              "Через нотатку або у CRM.",
+              "Не передаю — він сам розбереться."), "B"),
+        (qfmt("Що ви робите, якщо пацієнт відмовляється від лікування?",
+              "Пропоную дешевший варіант.",
+              "Запитую, що саме викликає сумнів.",
+              "Просто фіксую відмову."), "B"),
+        (qfmt("Як ви ставитесь до відгуків пацієнтів?",
+              "Не читаю — зайве нервування.",
+              "Читаю і думаю, як покращити комунікацію.",
+              "Вважаю, що більшість пишуть емоційно."), "B"),
     ],
     "Адміністратор": [
-        (qfmt("Як ви вітаєте пацієнта, якщо він запізнився?","Роблю зауваження — це ж правила.","Спокійно вітаю, пояснюю, що ми все одно приймемо.","Ігнорую ситуацію, щоб не псувати настрій."), "B"),
-        (qfmt("Якщо лікар затримується — що ви робите?","Кажу «чекайте».","Повідомляю, скільки часу орієнтовно чекати, і пропоную воду/каву.","А що я можу зробити? Це не моя зона відповідальності."), "B"),
-        (qfmt("Як ви реагуєте на скаргу?","Переадресовую керівнику.","Спокійно вислуховую, дякую за відгук і передаю далі.","Виправдовую колегу."), "B"),
-        (qfmt("Коли телефонуєте пацієнту після лікування, що ви кажете?","«Як себе почуваєте? Усе добре?»","«Ми нагадуємо про наступний візит.»","Не телефоную — якщо треба, сам подзвонить."), "A"),
-        (qfmt("Як завершуєте розмову по телефону?","«До побачення.»","«Гарного дня, чекаємо вас.»","Просто кладу слухавку. Розмова ж завершена."), "B"),
+        (qfmt("Як ви вітаєте пацієнта, якщо він запізнився?",
+              "Роблю зауваження — це ж правила.",
+              "Спокійно вітаю, пояснюю, що ми все одно приймемо.",
+              "Ігнорую ситуацію, щоб не псувати настрій."), "B"),
+        (qfmt("Якщо лікар затримується — що ви робите?",
+              "Кажу «чекайте».",
+              "Повідомляю, скільки часу орієнтовно чекати, і пропоную воду/каву.",
+              "А що я можу зробити? Це не моя зона відповідальності."), "B"),
+        (qfmt("Як ви реагуєте на скаргу?",
+              "Переадресовую керівнику.",
+              "Спокійно вислуховую, дякую за відгук і передаю далі.",
+              "Виправдовую колегу."), "B"),
+        (qfmt("Коли телефонуєте пацієнту після лікування, що ви кажете?",
+              "«Як себе почуваєте? Усе добре?»",
+              "«Ми нагадуємо про наступний візит.»",
+              "Не телефоную — якщо треба, сам подзвонить."), "A"),
+        (qfmt("Як завершуєте розмову по телефону?",
+              "«До побачення.»",
+              "«Гарного дня, чекаємо вас.»",
+              "Просто кладу слухавку. Розмова ж завершена."), "B"),
     ],
 }
 
 def _open_worksheet():
     if not HAS_GS:
         return None
-    creds_json = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON")
-    key = os.getenv("GOOGLE_SHEETS_SPREADSHEET_KEY")
-    name = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "Logs")
-    if not (creds_json and key):
+    if not (GS_CREDENTIALS_JSON and GS_SPREADSHEET_KEY):
         return None
     try:
-        creds = json.loads(creds_json)
+        creds = json.loads(GS_CREDENTIALS_JSON)
         gc = gspread.service_account_from_dict(creds)
-        sh = gc.open_by_key(key)
+        sh = gc.open_by_key(GS_SPREADSHEET_KEY)
         try:
-            ws = sh.worksheet(name)
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(name, rows=1000, cols=20)
+            ws = sh.worksheet(GS_WORKSHEET_NAME)
+        except WorksheetNotFound:
+            ws = sh.add_worksheet(GS_WORKSHEET_NAME, rows=1000, cols=20)
         return ws
     except Exception:
         return None
 
-async def log_result_async(user_id: int, role: str, correct: int, total: int):
+async def log_result_async(user_id: int, username: str, role: str, correct: int, errors: int):
     ws = await asyncio.to_thread(_open_worksheet)
     if not ws:
         return
-    row = [datetime.utcnow().isoformat(), str(user_id), role, str(correct), str(total)]
+    row = [datetime.utcnow().isoformat(), str(user_id), username or "", role, str(correct), str(errors)]
     async def _append():
         return await asyncio.to_thread(ws.append_row, row, value_input_option="RAW")
     try:
@@ -138,20 +189,10 @@ async def log_result_async(user_id: int, role: str, correct: int, total: int):
 
 app = FastAPI(title="CX Bot")
 
-class WebhookModel(BaseModel):
-    update_id: Optional[int] = None
-
-def _dedupe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
-    uid = getattr(update, "update_id", None)
-    if uid is None:
-        return None
-    last = context.user_data.get("last_update_id")
-    if last == uid:
-        if "role" not in context.user_data or "i" not in context.user_data:
-            return CHOOSING_ROLE
-        return ASKING
-    context.user_data["last_update_id"] = uid
-    return None
+def is_exit(text: str) -> bool:
+    t = (text or "").casefold().strip()
+    t = t.replace("🔚", "").strip()
+    return t.endswith("завершити")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -159,24 +200,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSING_ROLE
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = _dedupe(update, context)
-    if d is not None:
-        return d
     context.user_data.clear()
-    await safe_reply(update.message, text="Готово. Можете пройти мікроаудит ще раз — просто оберіть роль нижче 👇", reply_markup=ROLE_KB)
+    await safe_reply(update.message, text=f"Сесію завершено. Щоб почати заново — оберіть роль нижче 👇{_cta_suffix()}", reply_markup=ROLE_KB)
     return CHOOSING_ROLE
 
 async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = _dedupe(update, context)
-    if d is not None:
-        return d
-    text = (update.message.text or "").strip()
-    if text in EXIT_TEXTS or is_exit(text):
+    txt = (update.message.text or "").strip()
+    if txt in EXIT_BUTTONS or is_exit(txt):
         return await cancel(update, context)
-    if text not in ROLE_BUTTONS:
+    if txt not in ROLE_BUTTONS:
         await safe_reply(update.message, text="Оберіть роль, щоб почати 👇", reply_markup=ROLE_KB)
         return CHOOSING_ROLE
-    role = "Керівник" if "Керівник" in text else ("Лікар" if "Лікар" in text else "Адміністратор")
+    role = "Керівник" if "Керівник" in txt else ("Лікар" if "Лікар" in txt else "Адміністратор")
     context.user_data["role"] = role
     context.user_data["i"] = 0
     context.user_data["errors"] = 0
@@ -184,50 +219,48 @@ async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update.message, text=q, reply_markup=ABC_KB)
     return ASKING
 
+async def ask_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = context.user_data["role"]
+    i = context.user_data["i"]
+    q, _ = QUESTIONS[role][i]
+    await safe_reply(update.message, text=q, reply_markup=ABC_KB)
+    return ASKING
+
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = _dedupe(update, context)
-    if d is not None:
-        return d
     if "role" not in context.user_data or "i" not in context.user_data:
         await safe_reply(update.message, text="Спочатку оберіть роль 👇", reply_markup=ROLE_KB)
         return CHOOSING_ROLE
-    text = (update.message.text or "").strip()
-    if text in EXIT_TEXTS or is_exit(text):
+    txt = (update.message.text or "").strip()
+    if txt in EXIT_BUTTONS or is_exit(txt):
         return await cancel(update, context)
-    if text not in ABC_BUTTONS:
+    if txt not in ABC_BUTTONS:
         await safe_reply(update.message, text="Будь ласка, оберіть A, B або C 👇", reply_markup=ABC_KB)
         return ASKING
     role = context.user_data["role"]
     i = context.user_data["i"]
-    total = 5
-    correct_option = QUESTIONS[role][i][1]
-    if text != correct_option:
+    correct_letter = QUESTIONS[role][i][1]
+    if txt != correct_letter:
         context.user_data["errors"] += 1
-    i += 1
-    context.user_data["i"] = i
-    if i < total:
-        q, _ = QUESTIONS[role][i]
-        await safe_reply(update.message, text=q, reply_markup=ABC_KB)
-        return ASKING
-    correct = total - context.user_data["errors"]
-    result_text = ("Є сильні сторони і моменти, які можуть зіпсувати враження пацієнтів. Я можу показати, як це виглядає їх очима.\n\n"
-                   f"✅ Ви відповіли правильно на {correct} із {total}.\n\n"
-                   "Напишіть мені в особисті: @PavelZolottsev — підкажу, як швидко підтягнути сервіс.\n\n"
-                   "Хочете пройти тест у іншій ролі?")
-    await safe_reply(update.message, text=result_text, reply_markup=ROLE_KB)
+    context.user_data["i"] = i + 1
+    if context.user_data["i"] < 5:
+        return await ask_next(update, context)
+    correct_count = 5 - context.user_data["errors"]
+    msg = ("Є сильні сторони і моменти, які можуть зіпсувати враження пацієнтів. Я можу показати, як це виглядає їх очима."
+           if context.user_data["errors"] >= 2 else
+           "У Вас добрий рівень розуміння клієнтського досвіду. Ви відчуваєте, що сервіс — це більше, ніж просто послуга.")
+    final_text = f"{msg}\n\n✅ Ви відповіли правильно на {correct_count} із 5.{_cta_suffix()}\n\nХочете пройти тест у іншій ролі?"
+    await safe_reply(update.message, text=final_text, reply_markup=ROLE_KB)
     try:
-        asyncio.create_task(log_result_async(update.effective_user.id, role, correct, total))
+        user = update.effective_user
+        asyncio.create_task(log_result_async(user.id, user.username, role, correct_count, context.user_data['errors']))
     except Exception:
         pass
     context.user_data.clear()
     return CHOOSING_ROLE
 
 async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = _dedupe(update, context)
-    if d is not None:
-        return d
-    text = (update.message.text or "").strip()
-    if text in EXIT_TEXTS or is_exit(text):
+    txt = (update.message.text or "").strip()
+    if txt in EXIT_BUTTONS or is_exit(txt):
         return await cancel(update, context)
     if "role" not in context.user_data or "i" not in context.user_data:
         await safe_reply(update.message, text="Оберіть роль, щоб почати 👇", reply_markup=ROLE_KB)
@@ -252,7 +285,7 @@ conv = ConversationHandler(
 application.add_handler(conv)
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
 
-app = FastAPI(title="CX Bot")  # re-declare after handlers ok
+app = FastAPI(title="CX Bot")
 
 @app.get("/", response_class=PlainTextResponse)
 def health():
