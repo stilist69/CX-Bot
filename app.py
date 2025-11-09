@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 from telegram.error import TimedOut, RetryAfter, NetworkError
 
-# ---- Google Sheets logging ----
+# ---------- Google Sheets (optional, via ENV) ----------
 try:
     import gspread
     from gspread.exceptions import APIError as GSAPIError, WorksheetNotFound
@@ -28,20 +28,17 @@ except Exception:
     class GSAPIError(Exception): ...
     class WorksheetNotFound(Exception): ...
 
-# ==========================
-# Env
-# ==========================
+# ---------- ENV ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")      # сумісність; не обов'язковий
-APP_BASE_URL = os.getenv("APP_BASE_URL")
-SHEET_ID = os.getenv("SHEET_ID")
-GCP_SERVICE_ACCOUNT = os.getenv("GCP_SERVICE_ACCOUNT")  # JSON string
-CONTACT_USERNAME = os.getenv("CONTACT_USERNAME", "")    # stilist69 (без @)
-WORKSHEET_NAME = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "STAT")
+APP_BASE_URL = os.getenv("APP_BASE_URL")                # e.g. https://your-app.run.app
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")        # optional; not enforced
 
-# ==========================
-# Retry helper (fixed delays)
-# ==========================
+SHEET_ID = os.getenv("SHEET_ID")
+GCP_SERVICE_ACCOUNT = os.getenv("GCP_SERVICE_ACCOUNT")  # JSON string of credentials
+WORKSHEET_NAME = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "STAT")
+CONTACT_USERNAME = os.getenv("CONTACT_USERNAME", "")    # stilist69 (без @)
+
+# ---------- Retry helper ----------
 class RetryConfig:
     def __init__(self,
                  attempts: int = 5,
@@ -77,9 +74,7 @@ async def safe_reply(message, *, text: str, reply_markup=None):
         return await message.reply_text(text=text, reply_markup=reply_markup)
     return await retry_async(_send, cfg=TG_RETRY)
 
-# ==========================
-# Keyboards & constants
-# ==========================
+# ---------- Keyboards ----------
 ROLE_KB = ReplyKeyboardMarkup(
     [["👩‍💼 Керівник"], ["🦷 Лікар"], ["💬 Адміністратор"], ["🔚 Завершити"]],
     resize_keyboard=True
@@ -96,19 +91,16 @@ EXIT_BUTTONS = {"🔚 Завершити", "Завершити"}
 CHOOSING_ROLE, ASKING = range(2)
 
 def _cta_suffix() -> str:
-    handle = (CONTACT_USERNAME or "").lstrip("@")
-    return f"\n\nНапишіть мені в особисті: @{handle} — підкажу, як швидко підтягнути сервіс." if handle else ""
+    h = (CONTACT_USERNAME or "").lstrip("@")
+    return f"\n\nНапишіть мені в особисті: @{h} — підкажу, як швидко підтягнути сервіс." if h else ""
 
 def is_exit(text: str) -> bool:
     t = (text or "").casefold().strip()
     t = t.replace("🔚", "").strip()
     return t.endswith("завершити")
 
-# ==========================
-# Questions (preserved wording)
-# ==========================
-def qfmt(q, a, b, c):
-    return f"{q}\n\nA) {a}\nB) {b}\nC) {c}"
+# ---------- Questions ----------
+def qfmt(q, a, b, c): return f"{q}\n\nA) {a}\nB) {b}\nC) {c}"
 
 QUESTIONS: Dict[str, List[Tuple[str, str]]] = {
     "Керівник": [
@@ -179,9 +171,7 @@ QUESTIONS: Dict[str, List[Tuple[str, str]]] = {
     ],
 }
 
-# ==========================
-# Sheets helpers
-# ==========================
+# ---------- Sheets helpers ----------
 def _open_worksheet():
     if not HAS_GS or not SHEET_ID:
         return None
@@ -214,13 +204,26 @@ async def log_result_async(user_id: int, username: str, role: str, correct: int,
     except Exception:
         pass
 
-# ==========================
-# Bot logic
-# ==========================
+# ---------- Bot logic ----------
 app = FastAPI(title="CX Bot")
 
+@app.on_event("startup")
+async def _startup():
+    try:
+        await application.initialize()
+        print("PTB application initialized")
+    except Exception as e:
+        print("PTB init failed:", e)
+
+@app.on_event("shutdown")
+async def _shutdown():
+    try:
+        await application.shutdown()
+        print("PTB application shutdown")
+    except Exception as e:
+        print("PTB shutdown failed:", e)
+
 def _dedupe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Return True if this update_id was already handled for this user."""
     uid = getattr(update, "update_id", None)
     if uid is None:
         return False
@@ -234,18 +237,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _dedupe(update, context):  # захист від повторів
         return CHOOSING_ROLE
     context.user_data.clear()
-    await safe_reply(update.message,
-        text="Оберіть роль, щоб почати 👇",
-        reply_markup=ROLE_KB)
+    welcome = (
+        "Привіт! Я — CX Bot.\n"
+        "Допоможу Вам побачити клініку очима пацієнтів.\n"
+        "Це короткий тест із 5 запитань. Відповідайте чесно — тут не буває «поганих» результатів.\n\n"
+        "Оберіть свою роль 👇"
+    )
+    await safe_reply(update.message, text=welcome, reply_markup=ROLE_KB)
     return CHOOSING_ROLE
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _dedupe(update, context):
         return CHOOSING_ROLE
     context.user_data.clear()
-    await safe_reply(update.message,
-        text="Готово. Можете пройти мікроаудит ще раз — просто оберіть роль нижче 👇",
-        reply_markup=ROLE_KB)
+    await safe_reply(update.message, text="Готово. Можете пройти мікроаудит ще раз — просто оберіть роль нижче 👇", reply_markup=ROLE_KB)
     return CHOOSING_ROLE
 
 async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -256,19 +261,16 @@ async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cancel(update, context)
     if txt not in ROLE_BUTTONS:
         return await start(update, context)
-
     role = "Керівник" if "Керівник" in txt else ("Лікар" if "Лікар" in txt else "Адміністратор")
     context.user_data["role"] = role
     context.user_data["i"] = 0
     context.user_data["errors"] = 0
     context.user_data.pop("last_hint_ts", None)
-
     q, _ = QUESTIONS[role][0]
     await safe_reply(update.message, text=q, reply_markup=ABC_KB)
     return ASKING
 
 async def ask_again(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Єдиний м'який підказувач у стані ASKING (не частіше ніж раз на 2 сек)."""
     if _dedupe(update, context):
         return ASKING
     now = time.time()
@@ -287,7 +289,6 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if txt in EXIT_BUTTONS or is_exit(txt):
         return await cancel(update, context)
-
     if txt not in ABC_BUTTONS:
         return await ask_again(update, context)
 
@@ -303,7 +304,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update.message, text=q, reply_markup=ABC_KB)
         return ASKING
 
-    # Final message (unchanged style)
+    # Final message unchanged (+ optional CTA)
     correct_count = 5 - context.user_data["errors"]
     msg = ("Є сильні сторони і моменти, які можуть зіпсувати враження пацієнтів. Я можу показати, як це виглядає їх очима."
            if context.user_data["errors"] >= 2 else
@@ -320,14 +321,12 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return CHOOSING_ROLE
 
-# ==========================
-# FastAPI + PTB
-# ==========================
+# ---------- FastAPI + PTB ----------
 persistence = PicklePersistence(filepath="/tmp/cxbot_state.pickle")
-_token = BOT_TOKEN or "000:TEST_DUMMY_TOKEN"  # дає пройти CI без секретів
+_token = BOT_TOKEN or "000:TEST_DUMMY_TOKEN"
 application: Application = ApplicationBuilder().token(_token).persistence(persistence).build()
 
-# Strict per-state handlers (без глобального текстового хендлера)
+# Strict per-state handlers (no global TEXT handler)
 exit_handler = MessageHandler(filters.Regex(r"^(🔚 Завершити|Завершити)$"), cancel)
 role_handler = MessageHandler(filters.Regex(r"^(👩‍💼 Керівник|🦷 Лікар|💬 Адміністратор)$"), choose_role)
 abc_handler  = MessageHandler(filters.Regex(r"^(A|B|C)$"), handle_answer)
@@ -346,8 +345,6 @@ conv = ConversationHandler(
 )
 application.add_handler(conv)
 
-app = FastAPI(title="CX Bot")
-
 @app.get("/", response_class=PlainTextResponse)
 def health():
     return "ok"
@@ -363,20 +360,19 @@ async def set_webhook():
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
+    print("Webhook update:", data.get("update_id"), "message:", data.get("message", {}).get("text"))
     update = Update.de_json(data, application.bot)
-    await application.initialize()
     await application.process_update(update)
     return PlainTextResponse("ok")
 
 @app.post("/webhook/{_secret}")
 async def telegram_webhook_secret(_secret: str, request: Request):
-    # Backward-compatible; секрет не перевіряємо, просто приймаємо апдейт
     data = await request.json()
+    print("Webhook update:", data.get("update_id"), "message:", data.get("message", {}).get("text"))
     update = Update.de_json(data, application.bot)
-    await application.initialize()
     await application.process_update(update)
     return PlainTextResponse("ok")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+    uvicorn.run("app_clean:app", host="0.0.0.0", port=port)
