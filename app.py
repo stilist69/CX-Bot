@@ -209,19 +209,13 @@ app = FastAPI(title="CX Bot")
 
 @app.on_event("startup")
 async def _startup():
-    try:
-        await application.initialize()
-        print("PTB application initialized")
-    except Exception as e:
-        print("PTB init failed:", e)
+    await application.initialize()
+    print("PTB application initialized")
 
 @app.on_event("shutdown")
 async def _shutdown():
-    try:
-        await application.shutdown()
-        print("PTB application shutdown")
-    except Exception as e:
-        print("PTB shutdown failed:", e)
+    await application.shutdown()
+    print("PTB application shutdown")
 
 def _dedupe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     uid = getattr(update, "update_id", None)
@@ -368,11 +362,11 @@ async def telegram_webhook(request: Request):
 @app.post("/webhook/{_secret}")
 async def telegram_webhook_secret(_secret: str, request: Request):
     data = await request.json()
-    print("Webhook update:", data.get("update_id"), "message:", data.get("message", {}).get("text"))
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return PlainTextResponse("ok")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
-    uvicorn.run("app_clean:app", host="0.0.0.0", port=port)
+    # ГОЛОВНЕ: модуль і об'єкт правильні
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
