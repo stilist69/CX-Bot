@@ -17,7 +17,7 @@ from telegram.ext import (
 )
 from telegram.error import TimedOut, RetryAfter, NetworkError
 
-# Optional Google Sheets logging
+# ---- Google Sheets logging ----
 try:
     import gspread
     from gspread.exceptions import APIError as GSAPIError, WorksheetNotFound
@@ -27,16 +27,25 @@ except Exception:
     class GSAPIError(Exception): ...
     class WorksheetNotFound(Exception): ...
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-APP_BASE_URL = os.getenv("APP_BASE_URL", "")
-CONTACT_USERNAME = os.getenv("CONTACT_USERNAME", "@PavelZolottsev")
+# ==========================
+# Env (as before)
+# ==========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # required by runtime
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "set-a-secret")  # kept for parity (not used in URL)
+APP_BASE_URL = os.getenv("APP_BASE_URL")  # e.g. https://your-app.run.app
 
-GS_CREDENTIALS_JSON = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON", "")
-GS_SPREADSHEET_KEY  = os.getenv("GOOGLE_SHEETS_SPREADSHEET_KEY", "")
-GS_WORKSHEET_NAME   = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "STAT")
+SHEET_ID = os.getenv("SHEET_ID")  # spreadsheet key
+GCP_SERVICE_ACCOUNT = os.getenv("GCP_SERVICE_ACCOUNT")  # JSON string of service account
+CONTACT_USERNAME = os.getenv("CONTACT_USERNAME", "")  # e.g. stilist69 (без @)
 
+# ==========================
+# Retry helper (fixed delays)
+# ==========================
 class RetryConfig:
-    def __init__(self, attempts: int = 5, delays: List[float] = None, jitter: float = 0.0,
+    def __init__(self,
+                 attempts: int = 5,
+                 delays: List[float] = None,
+                 jitter: float = 0.0,
                  retry_on: Iterable[Type[BaseException]] = (TimedOut, RetryAfter, NetworkError, GSAPIError)):
         self.attempts = attempts
         self.delays = delays or [1.0, 2.0, 2.0, 3.0, 5.0]
@@ -57,7 +66,7 @@ async def retry_async(func: Callable, *, cfg: RetryConfig, **kwargs):
             if isinstance(e, RetryAfter) and getattr(e, "retry_after", None):
                 await asyncio.sleep(float(e.retry_after))
             else:
-                delay = cfg.delays[min(attempt-1, len(cfg.delays)-1)]
+                delay = cfg.delays[min(attempt - 1, len(cfg.delays) - 1)]
                 if cfg.jitter:
                     delay += random.uniform(0, cfg.jitter)
                 await asyncio.sleep(delay)
@@ -67,8 +76,14 @@ async def safe_reply(message, *, text: str, reply_markup=None):
         return await message.reply_text(text=text, reply_markup=reply_markup)
     return await retry_async(_send, cfg=TG_RETRY)
 
+# ==========================
+# Keyboards & constants
+# ==========================
 ROLE_KB = ReplyKeyboardMarkup(
-    [["👩‍💼 Керівник"], ["🦷 Лікар"], ["💬 Адміністратор"], ["🔚 Завершити"]],
+    [["👩‍💼 Керівник"],
+     ["🦷 Лікар"],
+     ["💬 Адміністратор"],
+     ["🔚 Завершити"]],
     resize_keyboard=True
 )
 ABC_KB = ReplyKeyboardMarkup(
@@ -86,6 +101,14 @@ def _cta_suffix() -> str:
     handle = (CONTACT_USERNAME or "").lstrip("@")
     return f"\n\nНапишіть мені в особисті: @{handle} — підкажу, як швидко підтягнути сервіс." if handle else ""
 
+def is_exit(text: str) -> bool:
+    t = (text or "").casefold().strip()
+    t = t.replace("🔚", "").strip()
+    return t.endswith("завершити")
+
+# ==========================
+# Questions (preserved wording)
+# ==========================
 def qfmt(q, a, b, c):
     return f"{q}\n\nA) {a}\nB) {b}\nC) {c}"
 
@@ -158,19 +181,27 @@ QUESTIONS: Dict[str, List[Tuple[str, str]]] = {
     ],
 }
 
+# ==========================
+# Sheets helpers
+# ==========================
 def _open_worksheet():
+    """Open worksheet STAT (or configured name). Returns gspread worksheet or None."""
     if not HAS_GS:
         return None
-    if not (GS_CREDENTIALS_JSON and GS_SPREADSHEET_KEY):
+    if not (SHEET_ID and (GCP_SERVICE_ACCOUNT or os.path.isfile("credentials.json"))):
         return None
     try:
-        creds = json.loads(GS_CREDENTIALS_JSON)
-        gc = gspread.service_account_from_dict(creds)
-        sh = gc.open_by_key(GS_SPREADSHEET_KEY)
+        if GCP_SERVICE_ACCOUNT:
+            creds = json.loads(GCP_SERVICE_ACCOUNT)
+            gc = gspread.service_account_from_dict(creds)
+        else:
+            gc = gspread.service_account(filename="credentials.json")
+        sh = gc.open_by_key(SHEET_ID)
+        name = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "STAT")
         try:
-            ws = sh.worksheet(GS_WORKSHEET_NAME)
+            ws = sh.worksheet(name)
         except WorksheetNotFound:
-            ws = sh.add_worksheet(GS_WORKSHEET_NAME, rows=1000, cols=20)
+            ws = sh.add_worksheet(name, rows=1000, cols=20)
         return ws
     except Exception:
         return None
@@ -187,21 +218,23 @@ async def log_result_async(user_id: int, username: str, role: str, correct: int,
     except Exception:
         pass
 
+# ==========================
+# Bot logic
+# ==========================
 app = FastAPI(title="CX Bot")
-
-def is_exit(text: str) -> bool:
-    t = (text or "").casefold().strip()
-    t = t.replace("🔚", "").strip()
-    return t.endswith("завершити")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await safe_reply(update.message, text="Оберіть роль, щоб почати 👇", reply_markup=ROLE_KB)
+    await safe_reply(update.message,
+        text="Оберіть роль, щоб почати 👇",
+        reply_markup=ROLE_KB)
     return CHOOSING_ROLE
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await safe_reply(update.message, text=f"Сесію завершено. Щоб почати заново — оберіть роль нижче 👇{_cta_suffix()}", reply_markup=ROLE_KB)
+    await safe_reply(update.message,
+        text="Сесію завершено. Щоб почати заново — оберіть роль нижче 👇",
+        reply_markup=ROLE_KB)
     return CHOOSING_ROLE
 
 async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -211,10 +244,12 @@ async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if txt not in ROLE_BUTTONS:
         await safe_reply(update.message, text="Оберіть роль, щоб почати 👇", reply_markup=ROLE_KB)
         return CHOOSING_ROLE
+
     role = "Керівник" if "Керівник" in txt else ("Лікар" if "Лікар" in txt else "Адміністратор")
     context.user_data["role"] = role
     context.user_data["i"] = 0
     context.user_data["errors"] = 0
+
     q, _ = QUESTIONS[role][0]
     await safe_reply(update.message, text=q, reply_markup=ABC_KB)
     return ASKING
@@ -230,31 +265,41 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "role" not in context.user_data or "i" not in context.user_data:
         await safe_reply(update.message, text="Спочатку оберіть роль 👇", reply_markup=ROLE_KB)
         return CHOOSING_ROLE
+
     txt = (update.message.text or "").strip()
     if txt in EXIT_BUTTONS or is_exit(txt):
         return await cancel(update, context)
+
     if txt not in ABC_BUTTONS:
         await safe_reply(update.message, text="Будь ласка, оберіть A, B або C 👇", reply_markup=ABC_KB)
         return ASKING
+
     role = context.user_data["role"]
     i = context.user_data["i"]
     correct_letter = QUESTIONS[role][i][1]
     if txt != correct_letter:
         context.user_data["errors"] += 1
+
     context.user_data["i"] = i + 1
     if context.user_data["i"] < 5:
         return await ask_next(update, context)
+
+    # Final message (unchanged style)
     correct_count = 5 - context.user_data["errors"]
     msg = ("Є сильні сторони і моменти, які можуть зіпсувати враження пацієнтів. Я можу показати, як це виглядає їх очима."
            if context.user_data["errors"] >= 2 else
            "У Вас добрий рівень розуміння клієнтського досвіду. Ви відчуваєте, що сервіс — це більше, ніж просто послуга.")
     final_text = f"{msg}\n\n✅ Ви відповіли правильно на {correct_count} із 5.{_cta_suffix()}\n\nХочете пройти тест у іншій ролі?"
+
     await safe_reply(update.message, text=final_text, reply_markup=ROLE_KB)
+
+    # Async log
     try:
         user = update.effective_user
         asyncio.create_task(log_result_async(user.id, user.username, role, correct_count, context.user_data['errors']))
     except Exception:
         pass
+
     context.user_data.clear()
     return CHOOSING_ROLE
 
@@ -262,14 +307,19 @@ async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if txt in EXIT_BUTTONS or is_exit(txt):
         return await cancel(update, context)
+
     if "role" not in context.user_data or "i" not in context.user_data:
         await safe_reply(update.message, text="Оберіть роль, щоб почати 👇", reply_markup=ROLE_KB)
         return CHOOSING_ROLE
+
     await safe_reply(update.message, text="Будь ласка, оберіть A, B або C 👇", reply_markup=ABC_KB)
     return ASKING
 
+# ==========================
+# FastAPI + PTB
+# ==========================
 persistence = PicklePersistence(filepath="/tmp/cxbot_state.pickle")
-_token = BOT_TOKEN or "000:TEST_DUMMY_TOKEN"
+_token = BOT_TOKEN or "000:TEST_DUMMY_TOKEN"  # allows CI checks without secret envs
 application: Application = ApplicationBuilder().token(_token).persistence(persistence).build()
 
 conv = ConversationHandler(
@@ -293,9 +343,9 @@ def health():
 
 @app.get("/set_webhook", response_class=PlainTextResponse)
 async def set_webhook():
-    if not APP_BASE_URL or not BOT_TOKEN:
+    if not (APP_BASE_URL and BOT_TOKEN):
         raise HTTPException(status_code=500, detail="APP_BASE_URL or BOT_TOKEN not set")
-    url = f"{APP_BASE_URL}/webhook"
+    url = f"{APP_BASE_URL}/webhook"  # no secret in URL
     await retry_async(application.bot.set_webhook, url=url, cfg=TG_RETRY)
     return f"set_webhook {url}"
 
