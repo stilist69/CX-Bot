@@ -1,362 +1,330 @@
-# -*- coding: utf-8 -*-
 import os
 import json
-import random
 import asyncio
-from typing import Callable, Iterable, Type, Dict, List, Tuple
+import random
+from typing import Callable, Type, Iterable
 from datetime import datetime
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
 import uvicorn
 
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, ApplicationBuilder, MessageHandler, CommandHandler,
     ConversationHandler, ContextTypes, PicklePersistence, filters
 )
 from telegram.error import TimedOut, RetryAfter, NetworkError
 
-# ---- Google Sheets logging ----
-try:
-    import gspread
-    from gspread.exceptions import APIError as GSAPIError, WorksheetNotFound
-    HAS_GS = True
-except Exception:
-    HAS_GS = False
-    class GSAPIError(Exception): ...
-    class WorksheetNotFound(Exception): ...
+import gspread
+from gspread.exceptions import APIError
 
-# ==========================
-# Env (as before)
-# ==========================
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # required by runtime
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "set-a-secret")  # kept for parity (not used in URL)
-APP_BASE_URL = os.getenv("APP_BASE_URL")  # e.g. https://your-app.run.app
-
-SHEET_ID = os.getenv("SHEET_ID")  # spreadsheet key
-GCP_SERVICE_ACCOUNT = os.getenv("GCP_SERVICE_ACCOUNT")  # JSON string of service account
-CONTACT_USERNAME = os.getenv("CONTACT_USERNAME", "")  # e.g. stilist69 (без @)
-
-# ==========================
-# Retry helper (fixed delays)
-# ==========================
+# =========================
+# Generalized async retry
+# =========================
 class RetryConfig:
-    def __init__(self,
-                 attempts: int = 5,
-                 delays: List[float] = None,
-                 jitter: float = 0.0,
-                 retry_on: Iterable[Type[BaseException]] = (TimedOut, RetryAfter, NetworkError, GSAPIError)):
+    def __init__(
+        self,
+        attempts: int = 5,
+        base_delay: float = 0.6,
+        max_delay: float = 8.0,
+        jitter: float = 0.35,
+        retry_on: Iterable[Type[BaseException]] = (),
+    ):
         self.attempts = attempts
-        self.delays = delays or [1.0, 2.0, 2.0, 3.0, 5.0]
+        self.base_delay = base_delay
+        self.max_delay = max_delay
         self.jitter = jitter
         self.retry_on = tuple(retry_on)
 
-TG_RETRY = RetryConfig()
+def _next_delay(base: float, attempt_idx: int, max_delay: float, jitter: float) -> float:
+    # exponential backoff with jitter
+    delay = min(max_delay, base * (2 ** attempt_idx))
+    delay *= (1 - jitter) + (2 * jitter) * random.random()
+    return delay
 
-async def retry_async(func: Callable, *, cfg: RetryConfig, **kwargs):
+async def retry_async(func: Callable, *args, cfg: RetryConfig, **kwargs):
     attempt = 0
     while True:
         try:
-            return await func(**kwargs)
-        except cfg.retry_on as e:  # type: ignore
+            return await func(*args, **kwargs)
+        except cfg.retry_on as e:
             attempt += 1
             if attempt >= cfg.attempts:
                 raise
-            if isinstance(e, RetryAfter) and getattr(e, "retry_after", None):
-                await asyncio.sleep(float(e.retry_after))
-            else:
-                delay = cfg.delays[min(attempt - 1, len(cfg.delays) - 1)]
-                if cfg.jitter:
-                    delay += random.uniform(0, cfg.jitter)
-                await asyncio.sleep(delay)
+            await asyncio.sleep(_next_delay(cfg.base_delay, attempt-1, cfg.max_delay, cfg.jitter))
 
-async def safe_reply(message, *, text: str, reply_markup=None):
-    async def _send():
-        return await message.reply_text(text=text, reply_markup=reply_markup)
-    return await retry_async(_send, cfg=TG_RETRY)
+# Retry presets
+TG_RETRY = RetryConfig(
+    attempts=5, base_delay=0.8, max_delay=6.0, jitter=0.4,
+    retry_on=(TimedOut, RetryAfter, NetworkError)
+)
+GS_RETRY = RetryConfig(
+    attempts=5, base_delay=1.0, max_delay=8.0, jitter=0.4,
+    retry_on=(APIError, ConnectionError, TimeoutError)
+)
 
-# ==========================
-# Keyboards & constants
-# ==========================
+# Convenience wrapper for sending replies with retry
+async def safe_reply(msg, *, cfg: RetryConfig = TG_RETRY, **kw):
+    return await retry_async(lambda **kw2: msg.reply_text(**kw2), cfg=cfg, **kw)
+
+# --- Env ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "set-a-secret")
+APP_BASE_URL = os.getenv("APP_BASE_URL")  # e.g. https://your-app.run.app
+SHEET_ID = os.getenv("SHEET_ID")
+GCP_SERVICE_ACCOUNT = os.getenv("GCP_SERVICE_ACCOUNT")  # JSON string (from Secret)
+CONTACT_USERNAME = os.getenv("CONTACT_USERNAME")  # e.g. stilist69 (без @)
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required")
+if not SHEET_ID:
+    raise RuntimeError("SHEET_ID is required")
+if not GCP_SERVICE_ACCOUNT:
+    raise RuntimeError("GCP_SERVICE_ACCOUNT JSON is required")
+
+# --- Google Sheets client ---
+def _gs_client():
+    sa_info = json.loads(GCP_SERVICE_ACCOUNT)
+    gc = gspread.service_account_from_dict(sa_info)
+    return gc
+
+async def log_to_sheet_async(role: str, correct: int, errors: int, chat_id: str, username: str|None):
+    """Append a row to STAT with retry; runs sync code in a thread to avoid blocking handlers."""
+    def _append_once():
+        gc = _gs_client()
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.worksheet("STAT")
+        result = "improve" if errors >= 2 else "strong"
+        ws.append_row([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            str(chat_id),
+            username or "",
+            role,
+            str(correct),
+            str(errors),
+            result
+        ], value_input_option="USER_ENTERED")
+
+    async def _append_async():
+        return await asyncio.to_thread(_append_once)
+
+    try:
+        await retry_async(_append_async, cfg=GS_RETRY)
+        print(f"[STAT] wrote row: role={role} correct={correct} errors={errors} chat={chat_id}", flush=True)
+    except Exception as e:
+        # Явно показуємо причину у логах Cloud Run
+        print("[STAT] logging error:", repr(e), flush=True)
+
+# --- Bot content (from blueprint) ---
+QUESTIONS = {
+    "kerivnyk": [
+        {"q":"Як ви дізнаєтесь, що пацієнт залишився задоволеним?","options":[" Якщо не скаржився — значить, усе добре."," Ми періодично запитуємо відгуки."," Лікарі самі бачать, коли пацієнт задоволений."],"correct":"B"},
+        {"q":"Як часто ви обговорюєте сервіс із командою?","options":[" Раз на рік на загальних зборах."," Коли з’являються проблеми."," Регулярно, як частину роботи."],"correct":"C"},
+        {"q":"Що для вас важливіше: нові пацієнти чи повторні?","options":[" Головне — потік нових."," Повторні — бо це показник довіри."," Обидва варіанти однакові."],"correct":"B"},
+        {"q":"Коли востаннє ви проходили шлях пацієнта особисто (дзвінок, запис, прийом)?","options":[" Ніколи."," Давно, але колись робив(-ла)."," Роблю це регулярно."],"correct":"C"},
+        {"q":"Як ви реагуєте на скаргу?","options":[" Захищаю команду — вони стараються."," Розбираюсь спокійно, шукаю, що можна покращити."," Ігнорую, якщо пацієнт «важкий»."],"correct":"B"}
+    ],
+    "likar": [
+        {"q":"Як ви пояснюєте пацієнту план лікування?","options":[" Стисло — без деталей."," Детально, простою мовою, показую приклади."," Лише тоді, коли питає."],"correct":"B"},
+        {"q":"Що ви робите, якщо пацієнт нервує?","options":[" Продовжую працювати — час дорогоцінний."," Роблю паузу, пояснюю, що буде далі."," Прошу адміністратора/асистента заспокоїти."],"correct":"B"},
+        {"q":"Як ви передаєте інформацію адміністратору після прийому?","options":[" Усно, коли є час."," Через нотатку або у CRM."," Не передаю — він сам розбереться."],"correct":"B"},
+        {"q":"Що ви робите, якщо пацієнт відмовляється від лікування?","options":[" Пропоную дешевший варіант."," Запитую, що саме викликає сумнів."," Просто фіксую відмову."],"correct":"B"},
+        {"q":"Як ви ставитесь до відгуків пацієнтів?","options":[" Не читаю — зайве нервування."," Читаю і думаю, як покращити комунікацію."," Вважаю, що більшість пишуть емоційно."],"correct":"B"}
+    ],
+    "admin": [
+        {"q":"Як ви вітаєте пацієнта, якщо він запізнився?","options":[" Роблю зауваження — це ж правила."," Спокійно вітаю, пояснюю, що ми все одно приймемо."," Ігнорую ситуацію, щоб не псувати настрій."],"correct":"B"},
+        {"q":"Якщо лікар затримується — що ви робите?","options":[" Кажу «чекайте»."," Повідомляю, скільки часу орієнтовно чекати, і пропоную воду/каву."," А що я можу зробити? Це не моя зона відповідальності."],"correct":"B"},
+        {"q":"Як ви реагуєте на скаргу?","options":[" Переадресовую керівнику."," Спокійно вислуховую, дякую за відгук і передаю далі."," Виправдовую колегу."],"correct":"B"},
+        {"q":"Коли телефонуєте пацієнту після лікування, що ви кажете?","options":[" «Як себе почуваєте? Усе добре?»"," «Ми нагадуємо про наступний візит.»"," Не телефоную — якщо треба, сам подзвонить."],"correct":"A"},
+        {"q":"Як завершуєте розмову по телефону?","options":[" «До побачення.»"," «Гарного дня, чекаємо вас.»"," Просто кладу слухавку. Розмова ж завершена."],"correct":"B"}
+    ]
+}
+
+CHOOSING_ROLE, ASKING = range(2)
 ROLE_KB = ReplyKeyboardMarkup(
     [["👩‍💼 Керівник"],
      ["🦷 Лікар"],
      ["💬 Адміністратор"],
      ["🔚 Завершити"]],
     resize_keyboard=True
-)
-ABC_KB = ReplyKeyboardMarkup(
-    [["A", "B", "C"], ["🔚 Завершити"]],
-    resize_keyboard=True
-)
+    )
+ABC_KB  = ReplyKeyboardMarkup([["A","B","C"]], resize_keyboard=True)
 
-ROLE_BUTTONS = {"👩‍💼 Керівник", "🦷 Лікар", "💬 Адміністратор"}
-ABC_BUTTONS = {"A", "B", "C"}
-EXIT_BUTTONS = {"🔚 Завершити", "Завершити"}
-
-CHOOSING_ROLE, ASKING = range(2)
-
-def _cta_suffix() -> str:
-    handle = (CONTACT_USERNAME or "").lstrip("@")
-    return f"\n\nНапишіть мені в особисті: @{handle} — підкажу, як швидко підтягнути сервіс." if handle else ""
-
-def is_exit(text: str) -> bool:
-    t = (text or "").casefold().strip()
-    t = t.replace("🔚", "").strip()
-    return t.endswith("завершити")
-
-# ==========================
-# Questions (preserved wording)
-# ==========================
-def qfmt(q, a, b, c):
-    return f"{q}\n\nA) {a}\nB) {b}\nC) {c}"
-
-QUESTIONS: Dict[str, List[Tuple[str, str]]] = {
-    "Керівник": [
-        (qfmt("Як ви дізнаєтесь, що пацієнт залишився задоволеним?",
-              "Якщо не скаржився — значить, усе добре.",
-              "Ми періодично запитуємо відгуки.",
-              "Лікарі самі бачать, коли пацієнт задоволений."), "B"),
-        (qfmt("Як часто ви обговорюєте сервіс із командою?",
-              "Раз на рік на загальних зборах.",
-              "Коли з’являються проблеми.",
-              "Регулярно, як частину роботи."), "C"),
-        (qfmt("Що для вас важливіше: нові пацієнти чи повторні?",
-              "Головне — потік нових.",
-              "Повторні — бо це показник довіри.",
-              "Обидва варіанти однакові."), "B"),
-        (qfmt("Коли востаннє ви проходили шлях пацієнта особисто (дзвінок, запис, прийом)?",
-              "Ніколи.",
-              "Давно, але колись робив(-ла).",
-              "Роблю це регулярно."), "C"),
-        (qfmt("Як ви реагуєте на скаргу?",
-              "Захищаю команду — вони стараються.",
-              "Розбираюсь спокійно, шукаю, що можна покращити.",
-              "Ігнорую, якщо пацієнт «важкий»."), "B"),
-    ],
-    "Лікар": [
-        (qfmt("Як ви пояснюєте пацієнту план лікування?",
-              "Стисло — без деталей.",
-              "Детально, простою мовою, показую приклади.",
-              "Лише тоді, коли питає."), "B"),
-        (qfmt("Що ви робите, якщо пацієнт нервує?",
-              "Продовжую працювати — час дорогоцінний.",
-              "Роблю паузу, пояснюю, що буде далі.",
-              "Прошу адміністратора/асистента заспокоїти."), "B"),
-        (qfmt("Як ви передаєте інформацію адміністратору після прийому?",
-              "Усно, коли є час.",
-              "Через нотатку або у CRM.",
-              "Не передаю — він сам розбереться."), "B"),
-        (qfmt("Що ви робите, якщо пацієнт відмовляється від лікування?",
-              "Пропоную дешевший варіант.",
-              "Запитую, що саме викликає сумнів.",
-              "Просто фіксую відмову."), "B"),
-        (qfmt("Як ви ставитесь до відгуків пацієнтів?",
-              "Не читаю — зайве нервування.",
-              "Читаю і думаю, як покращити комунікацію.",
-              "Вважаю, що більшість пишуть емоційно."), "B"),
-    ],
-    "Адміністратор": [
-        (qfmt("Як ви вітаєте пацієнта, якщо він запізнився?",
-              "Роблю зауваження — це ж правила.",
-              "Спокійно вітаю, пояснюю, що ми все одно приймемо.",
-              "Ігнорую ситуацію, щоб не псувати настрій."), "B"),
-        (qfmt("Якщо лікар затримується — що ви робите?",
-              "Кажу «чекайте».",
-              "Повідомляю, скільки часу орієнтовно чекати, і пропоную воду/каву.",
-              "А що я можу зробити? Це не моя зона відповідальності."), "B"),
-        (qfmt("Як ви реагуєте на скаргу?",
-              "Переадресовую керівнику.",
-              "Спокійно вислуховую, дякую за відгук і передаю далі.",
-              "Виправдовую колегу."), "B"),
-        (qfmt("Коли телефонуєте пацієнту після лікування, що ви кажете?",
-              "«Як себе почуваєте? Усе добре?»",
-              "«Ми нагадуємо про наступний візит.»",
-              "Не телефоную — якщо треба, сам подзвонить."), "A"),
-        (qfmt("Як завершуєте розмову по телефону?",
-              "«До побачення.»",
-              "«Гарного дня, чекаємо вас.»",
-              "Просто кладу слухавку. Розмова ж завершена."), "B"),
-    ],
+ROLE_LABELS = {
+    "👩‍💼 Керівник": "kerivnyk",
+    "🦷 Лікар": "likar",
+    "💬 Адміністратор": "admin",
 }
 
-# ==========================
-# Sheets helpers
-# ==========================
-def _open_worksheet():
-    """Open worksheet STAT (or configured name). Returns gspread worksheet or None."""
-    if not HAS_GS:
-        return None
-    if not (SHEET_ID and (GCP_SERVICE_ACCOUNT or os.path.isfile("credentials.json"))):
-        return None
-    try:
-        if GCP_SERVICE_ACCOUNT:
-            creds = json.loads(GCP_SERVICE_ACCOUNT)
-            gc = gspread.service_account_from_dict(creds)
-        else:
-            gc = gspread.service_account(filename="credentials.json")
-        sh = gc.open_by_key(SHEET_ID)
-        name = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "STAT")
-        try:
-            ws = sh.worksheet(name)
-        except WorksheetNotFound:
-            ws = sh.add_worksheet(name, rows=1000, cols=20)
-        return ws
-    except Exception:
-        return None
+def role_code_from_text(text: str) -> str | None:
+    return ROLE_LABELS.get(text.strip())
 
-async def log_result_async(user_id: int, username: str, role: str, correct: int, errors: int):
-    ws = await asyncio.to_thread(_open_worksheet)
-    if not ws:
-        return
-    row = [datetime.utcnow().isoformat(), str(user_id), username or "", role, str(correct), str(errors)]
-    async def _append():
-        return await asyncio.to_thread(ws.append_row, row, value_input_option="RAW")
-    try:
-        await retry_async(_append, cfg=TG_RETRY)
-    except Exception:
-        pass
-
-# ==========================
-# Bot logic
-# ==========================
-app = FastAPI(title="CX Bot")
+def _cta_suffix() -> str:
+    if CONTACT_USERNAME:
+        handle = CONTACT_USERNAME.lstrip("@")
+        return f"\n\nНапишіть мені в особисті: @{handle} — підкажу, як швидко підтягнути сервіс."
+    return ""
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await safe_reply(update.message,
-        text="Оберіть роль, щоб почати 👇",
-        reply_markup=ROLE_KB)
-    return CHOOSING_ROLE
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await safe_reply(update.message,
-        text="Сесію завершено. Щоб почати заново — оберіть роль нижче 👇",
-        reply_markup=ROLE_KB)
+    await safe_reply(
+        update.message,
+        text=(
+            "Привіт! Я — CX Bot.\n"
+            "Допоможу Вам побачити клініку очима пацієнтів.\n"
+            "Це короткий тест із 5 запитань. Відповідайте чесно — тут не буває «поганих» результатів.\n\n"
+            "Оберіть свою роль 👇"
+        ),
+        reply_markup=ROLE_KB
+    )
     return CHOOSING_ROLE
 
 async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
-    if txt in EXIT_BUTTONS or is_exit(txt):
-        return await cancel(update, context)
-    if txt not in ROLE_BUTTONS:
-        await safe_reply(update.message, text="Оберіть роль, щоб почати 👇", reply_markup=ROLE_KB)
+    text = (update.message.text or "").strip()
+    if text.endswith("Завершити"):
+        context.user_data.clear()
+        await safe_reply(update.message,
+            text="Сесію завершено. Щоб почати заново — оберіть роль нижче 👇" + _cta_suffix(),
+            reply_markup=ROLE_KB)
         return CHOOSING_ROLE
 
-    role = "Керівник" if "Керівник" in txt else ("Лікар" if "Лікар" in txt else "Адміністратор")
+    role = role_code_from_text(text)
+    if not role:
+        # не приймаємо довільний текст — просимо натиснути кнопку
+        await safe_reply(update.message,
+            text="Будь ласка, оберіть роль на клавіатурі нижче 👇",
+            reply_markup=ROLE_KB)
+        return CHOOSING_ROLE
+
     context.user_data["role"] = role
     context.user_data["i"] = 0
     context.user_data["errors"] = 0
-
-    q, _ = QUESTIONS[role][0]
-    await safe_reply(update.message, text=q, reply_markup=ABC_KB)
-    return ASKING
+    return await ask_next(update, context)
 
 async def ask_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = context.user_data["role"]
     i = context.user_data["i"]
-    q, _ = QUESTIONS[role][i]
-    await safe_reply(update.message, text=q, reply_markup=ABC_KB)
+    q = QUESTIONS[role][i]
+    body = f"{q['q']}\n\nA) {q['options'][0]}\nB) {q['options'][1]}\nC) {q['options'][2]}"
+    await safe_reply(update.message, text=body, reply_markup=ABC_KB)
     return ASKING
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "role" not in context.user_data or "i" not in context.user_data:
-        await safe_reply(update.message, text="Спочатку оберіть роль 👇", reply_markup=ROLE_KB)
-        return CHOOSING_ROLE
-
     txt = (update.message.text or "").strip()
-    if txt in EXIT_BUTTONS or is_exit(txt):
+    if txt.endswith("Завершити"):
         return await cancel(update, context)
-
-    if txt not in ABC_BUTTONS:
-        await safe_reply(update.message, text="Будь ласка, оберіть A, B або C 👇", reply_markup=ABC_KB)
-        return ASKING
 
     role = context.user_data["role"]
     i = context.user_data["i"]
-    correct_letter = QUESTIONS[role][i][1]
-    if txt != correct_letter:
-        context.user_data["errors"] += 1
+    answer = txt.upper()
+    if answer not in ("A","B","C"):
+        await safe_reply(update.message, text="Будь ласка, оберіть лише A, B або C 🙂", reply_markup=ABC_KB)
+        return ASKING
 
-    context.user_data["i"] = i + 1
+    correct = QUESTIONS[role][i]["correct"]
+    if answer != correct:
+        context.user_data["errors"] += 1
+    context.user_data["i"] += 1
+
     if context.user_data["i"] < 5:
         return await ask_next(update, context)
 
-    # Final message (unchanged style)
     correct_count = 5 - context.user_data["errors"]
     msg = ("Є сильні сторони і моменти, які можуть зіпсувати враження пацієнтів. Я можу показати, як це виглядає їх очима."
            if context.user_data["errors"] >= 2 else
            "У Вас добрий рівень розуміння клієнтського досвіду. Ви відчуваєте, що сервіс — це більше, ніж просто послуга.")
-    final_text = f"{msg}\n\n✅ Ви відповіли правильно на {correct_count} із 5.{_cta_suffix()}\n\nХочете пройти тест у іншій ролі?"
+    await safe_reply(
+        update.message,
+        text=f"{msg}\n\n✅ Ви відповіли правильно на {correct_count} із 5.{_cta_suffix()}\n\nХочете пройти тест у іншій ролі?",
+        reply_markup=ROLE_KB
+    )
 
-    await safe_reply(update.message, text=final_text, reply_markup=ROLE_KB)
+    # Log to sheets (асинхронно, з ретраєм)
+    chat = update.effective_user
+    asyncio.create_task(
+        log_to_sheet_async(role, correct_count, context.user_data["errors"], chat.id, chat.username)
+    )
 
-    # Async log
-    try:
-        user = update.effective_user
-        asyncio.create_task(log_result_async(user.id, user.username, role, correct_count, context.user_data['errors']))
-    except Exception:
-        pass
-
-    context.user_data.clear()
     return CHOOSING_ROLE
 
-async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
-    if txt in EXIT_BUTTONS or is_exit(txt):
-        return await cancel(update, context)
+async def cancel(update, context):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Готово. Можете пройти мікроаудит ще раз — просто оберіть роль нижче 👇",
+        reply_markup=ROLE_KB
+    )
+    return CHOOSING_ROLE
 
-    if "role" not in context.user_data or "i" not in context.user_data:
-        await safe_reply(update.message, text="Оберіть роль, щоб почати 👇", reply_markup=ROLE_KB)
-        return CHOOSING_ROLE
+exit_handler = MessageHandler(filters.Regex(r"^🔚 Завершити$"), cancel)
 
-    await safe_reply(update.message, text="Будь ласка, оберіть A, B або C 👇", reply_markup=ABC_KB)
-    return ASKING
+# --- FastAPI + PTB integration ---
+app = FastAPI(title="CX Bot")
 
-# ==========================
-# FastAPI + PTB
-# ==========================
+# Використовуємо /tmp — єдиний writable каталог у Cloud Run
 persistence = PicklePersistence(filepath="/tmp/cxbot_state.pickle")
-_token = BOT_TOKEN or "000:TEST_DUMMY_TOKEN"  # allows CI checks without secret envs
-application: Application = ApplicationBuilder().token(_token).persistence(persistence).build()
+application: Application = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).build()
 
 conv = ConversationHandler(
     entry_points=[CommandHandler("start", start)],
     states={
-        CHOOSING_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_role)],
-        ASKING: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_answer)],
+        CHOOSING_ROLE: [exit_handler,
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, choose_role)],
+        ASKING:        [exit_handler,
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_answer)],
     },
     fallbacks=[CommandHandler("cancel", cancel)],
     name="cxbot",
     persistent=True,
 )
-application.add_handler(conv)
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
 
-app = FastAPI(title="CX Bot")
+application.add_handler(conv)
+
+class WebhookModel(BaseModel):
+    update_id: int | None = None
+
+# --- Catch-all fallback (на випадок будь-якого тексту поза сценарієм)
+async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_reply(
+        update.message,
+        text="Зараз ми проходимо тест 🙂 Оберіть варіант нижче 👇"
+    )
+
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
 
 @app.get("/", response_class=PlainTextResponse)
 def health():
     return "ok"
 
 @app.get("/set_webhook", response_class=PlainTextResponse)
-async def set_webhook():
-    if not (APP_BASE_URL and BOT_TOKEN):
-        raise HTTPException(status_code=500, detail="APP_BASE_URL or BOT_TOKEN not set")
-    url = f"{APP_BASE_URL}/webhook"  # no secret in URL
-    await retry_async(application.bot.set_webhook, url=url, cfg=TG_RETRY)
+async def set_webhook(secret: str):
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+    if not APP_BASE_URL:
+        raise HTTPException(status_code=400, detail="APP_BASE_URL not set")
+    url = f"{APP_BASE_URL}/webhook/{WEBHOOK_SECRET}"
+    await retry_async(application.bot.set_webhook, url, cfg=TG_RETRY)
     return f"set_webhook {url}"
 
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
+@app.post("/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
     data = await request.json()
     update = Update.de_json(data, application.bot)
-    await application.initialize()
     await application.process_update(update)
-    return PlainTextResponse("ok")
+    return {"ok": True}
+
+@app.on_event("startup")
+async def on_startup():
+    await application.initialize()
+    await application.start()
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await application.stop()
+    await application.shutdown()
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
