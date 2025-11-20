@@ -101,8 +101,9 @@ def is_exit(text: str) -> bool:
     return t.endswith("завершити")
 
 # ---------- Questions ----------
-def qfmt(q, a, b, c): 
-    return f"{q}\n\nA) {a}\nB) {b}\nC) {c}"
+def qfmt(q, a, b, c):
+    ZW = "\u200b"  # невидимий символ
+    return f"{q}\n\nA) {a}\n{ZW}\nB) {b}\n{ZW}\nC) {c}"
 
 QUESTIONS: Dict[str, List[Tuple[str, str]]] = {
     "Керівник": [
@@ -288,12 +289,14 @@ app = FastAPI(title="CX Bot")
 @app.on_event("startup")
 async def _startup():
     await application.initialize()
-    application.job_queue.start()
+    if application.job_queue:
+        application.job_queue.start()
     print("PTB application initialized")
 
 @app.on_event("shutdown")
 async def _shutdown():
-    application.job_queue.stop()
+    if application.job_queue:
+        application.job_queue.stop()
     await application.shutdown()
     print("PTB application shutdown")
 
@@ -307,6 +310,8 @@ def _dedupe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     context.user_data["_last_update_id"] = uid
     return False
 
+TIMEOUT_AFTER_FINAL = 600  # 10 хв
+
 async def restart_after_idle(context: ContextTypes.DEFAULT_TYPE):
     """Спрацьовує, якщо після фінального екрану немає дій 10 хвилин."""
     job = context.job  # type: ignore[attr-defined]
@@ -319,22 +324,37 @@ async def restart_after_idle(context: ContextTypes.DEFAULT_TYPE):
     )
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=ROLE_KB)
 
-def cancel_postfinal_restart(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+
+def cancel_postfinal_restart(chat_id: int):
     """При будь-якій новій взаємодії скасовуємо таймер після фіналу."""
-    if not context.job_queue:
+    jq = application.job_queue
+    if not jq:
         return
-    jobs = context.job_queue.get_jobs_by_name(f"postfinal-{chat_id}")
+    jobs = jq.get_jobs_by_name(f"postfinal-{chat_id}")
     for j in jobs:
         try:
             j.schedule_removal()
         except Exception:
             pass
 
+
+def schedule_postfinal_restart(chat_id: int):
+    """Ставимо таймер після фіналу."""
+    jq = application.job_queue
+    if not jq:
+        return
+    jq.run_once(
+        restart_after_idle,
+        TIMEOUT_AFTER_FINAL,
+        chat_id=chat_id,
+        name=f"postfinal-{chat_id}",
+    )
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _dedupe(update, context):  # захист від повторів
         return CHOOSING_ROLE
 
-    cancel_postfinal_restart(context, update.effective_chat.id)
+    cancel_postfinal_restart(update.effective_chat.id)
 
     context.user_data.clear()
     welcome = (
@@ -350,7 +370,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _dedupe(update, context):
         return CHOOSING_ROLE
 
-    cancel_postfinal_restart(context, update.effective_chat.id)
+    cancel_postfinal_restart(update.effective_chat.id)
     
     context.user_data.clear()
     await safe_reply(update.message, text="Готово. Можете пройти мікроаудит ще раз — просто оберіть роль нижче 👇", reply_markup=ROLE_KB)
@@ -360,7 +380,7 @@ async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _dedupe(update, context):
         return CHOOSING_ROLE
 
-    cancel_postfinal_restart(context, update.effective_chat.id)
+    cancel_postfinal_restart(update.effective_chat.id)
 
     txt = (update.message.text or "").strip()
     if txt in EXIT_BUTTONS or is_exit(txt):
@@ -420,13 +440,8 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Ставимо таймер: якщо 10 хвилин нічого не натиснули після фіналу —
     # бот сам повертає на екран вибору ролі
-    if context.job_queue:
-        context.job_queue.run_once(
-            restart_after_idle,
-            TIMEOUT_AFTER_FINAL,
-            chat_id=update.effective_chat.id,
-            name=f"postfinal-{update.effective_chat.id}",
-        )
+
+    schedule_postfinal_restart(update.effective_chat.id)
 
     try:
         user = update.effective_user
