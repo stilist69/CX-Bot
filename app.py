@@ -309,51 +309,9 @@ def _dedupe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     context.user_data["_last_update_id"] = uid
     return False
 
-TIMEOUT_AFTER_FINAL = 60  # 1 хв
-
-async def restart_after_idle(context: ContextTypes.DEFAULT_TYPE):
-    """Спрацьовує, якщо після фінального екрану немає дій 10 хвилин."""
-    job = context.job  # type: ignore[attr-defined]
-    chat_id = job.chat_id  # type: ignore[attr-defined]
-
-    text = (
-        "Я завершив мікроаудит і дав підсумки.\n"
-        "Щоб продовжити, повертаю вас на початок тесту.\n\n"
-        "Оберіть свою роль 👇"
-    )
-    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=ROLE_KB)
-
-
-def cancel_postfinal_restart(chat_id: int):
-    """При будь-якій новій взаємодії скасовуємо таймер після фіналу."""
-    jq = application.job_queue
-    if not jq:
-        return
-    jobs = jq.get_jobs_by_name(f"postfinal-{chat_id}")
-    for j in jobs:
-        try:
-            j.schedule_removal()
-        except Exception:
-            pass
-
-
-def schedule_postfinal_restart(chat_id: int):
-    """Ставимо таймер після фіналу."""
-    jq = application.job_queue
-    if not jq:
-        return
-    jq.run_once(
-        restart_after_idle,
-        TIMEOUT_AFTER_FINAL,
-        chat_id=chat_id,
-        name=f"postfinal-{chat_id}",
-    )
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _dedupe(update, context):  # захист від повторів
         return CHOOSING_ROLE
-
-    cancel_postfinal_restart(update.effective_chat.id)
 
     context.user_data.clear()
     welcome = (
@@ -369,8 +327,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _dedupe(update, context):
         return CHOOSING_ROLE
 
-    cancel_postfinal_restart(update.effective_chat.id)
-    
     context.user_data.clear()
     await safe_reply(update.message, text="Готово. Можете пройти мікроаудит ще раз — просто оберіть роль нижче 👇", reply_markup=ROLE_KB)
     return CHOOSING_ROLE
@@ -378,8 +334,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def choose_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _dedupe(update, context):
         return CHOOSING_ROLE
-
-    cancel_postfinal_restart(update.effective_chat.id)
 
     txt = (update.message.text or "").strip()
     if txt in EXIT_BUTTONS or is_exit(txt):
@@ -437,11 +391,6 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     final_text = f"{msg}\n\n✅ Ви відповіли правильно на {correct_count} із 5.{_cta_suffix()}\n\nХочете пройти тест у іншій ролі?"
     await safe_reply(update.message, text=final_text, reply_markup=ROLE_KB)
 
-    # Ставимо таймер: якщо 10 хвилин нічого не натиснули після фіналу —
-    # бот сам повертає на екран вибору ролі
-
-    schedule_postfinal_restart(update.effective_chat.id)
-
     try:
         user = update.effective_user
         await log_result_async(user.id, user.username, role, correct_count, context.user_data['errors'])
@@ -449,7 +398,8 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     context.user_data.clear()
-    return CHOOSING_ROLE
+    # Завершуємо розмову: далі будь-яке натискання спрацює як новий вхід через entry_points
+    return ConversationHandler.END
 
 # ---------- FastAPI + PTB ----------
 persistence = PicklePersistence(filepath="/tmp/cxbot_state.pickle")
