@@ -89,7 +89,6 @@ ABC_BUTTONS = {"A", "B", "C"}
 EXIT_BUTTONS = {"🔚 Завершити", "Завершити"}
 
 CHOOSING_ROLE, ASKING = range(2)
-TIMEOUT_AFTER_FINAL = 600  # 10 хвилин після фінального повідомлення
 
 def _cta_suffix() -> str:
     h = (CONTACT_USERNAME or "").lstrip("@")
@@ -310,7 +309,7 @@ def _dedupe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     context.user_data["_last_update_id"] = uid
     return False
 
-TIMEOUT_AFTER_FINAL = 600  # 10 хв
+TIMEOUT_AFTER_FINAL = 60  # 1 хв
 
 async def restart_after_idle(context: ContextTypes.DEFAULT_TYPE):
     """Спрацьовує, якщо після фінального екрану немає дій 10 хвилин."""
@@ -465,7 +464,12 @@ fallback_role = MessageHandler(filters.TEXT & ~filters.COMMAND, start)
 fallback_asking = MessageHandler(filters.TEXT & ~filters.COMMAND, ask_again)
 
 conv = ConversationHandler(
-    entry_points=[CommandHandler("start", start)],
+    entry_points=[
+        CommandHandler("start", start),
+        exit_handler,   # "🔚 Завершити" теж може стати входом
+        role_handler,   # натиснув роль – можна стартувати навіть з нуля
+        abc_handler,    # навіть якщо тисне A/B/C зі старої клавіатури
+    ],
     states={
         CHOOSING_ROLE: [exit_handler, role_handler, fallback_role],
         ASKING:        [exit_handler, abc_handler,  fallback_asking],
